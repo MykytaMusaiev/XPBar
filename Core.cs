@@ -1,8 +1,11 @@
 namespace XPBar
 {
     using System;
+    using System.Diagnostics;
+    using System.Globalization;
     using System.IO;
     using System.Numerics;
+    using System.Runtime.InteropServices;
     using GameHelper;
     using GameHelper.Plugin;
     using GameHelper.RemoteEnums;
@@ -133,6 +136,7 @@ namespace XPBar
             {
                 var content = File.ReadAllText(this.SettingPathname);
                 this.Settings = JsonConvert.DeserializeObject<XPBarSettings>(content) ?? new XPBarSettings();
+                this.Settings.CustomLabel ??= string.Empty;
             }
             catch (Exception ex) when (ex is IOException ||
                                        ex is UnauthorizedAccessException ||
@@ -157,17 +161,32 @@ namespace XPBar
         public override void DrawSettings()
         {
             ImGui.Checkbox("Enable XP overlay", ref this.Settings.Enable);
-            ImGui.Checkbox("Show background", ref this.Settings.ShowBackground);
-            ImGui.Checkbox("Show raw XP", ref this.Settings.ShowRawDebug);
 
-            ImGui.SliderFloat("Position X", ref this.Settings.PositionX, -800f, 800f, "%.0f px");
-            ImGui.SliderFloat("Position Y", ref this.Settings.PositionY, -400f, 200f, "%.0f px");
+            if (ImGui.CollapsingHeader("Basic Settings"))
+            {
+                ImGui.Checkbox("Show background", ref this.Settings.ShowBackground);
+                ImGui.Checkbox("Hide when game is not foreground", ref this.Settings.HideWhenGameNotForeground);
+                ImGui.Checkbox("Show when GameHelper is foreground", ref this.Settings.ShowWhenGameHelperForeground);
 
-            ImGui.ColorEdit4("Text color", ref this.Settings.TextColor);
-            ImGui.ColorEdit4("Background color", ref this.Settings.BackgroundColor);
+                ImGui.SliderFloat("Position X", ref this.Settings.PositionX, -800f, 800f, "%.0f px");
+                ImGui.SliderFloat("Position Y", ref this.Settings.PositionY, -400f, 200f, "%.0f px");
+                ImGui.Checkbox("Center by width", ref this.Settings.CenterByWidth);
+                ImGui.SliderInt("Decimal places", ref this.Settings.DecimalPlaces, 0, 4);
+                ImGui.InputText("Custom label", ref this.Settings.CustomLabel, 128);
+                ImGui.SliderFloat("Text scale", ref this.Settings.TextScale, 0.5f, 3f, "%.2f");
+                ImGui.Checkbox("Auto scale", ref this.Settings.AutoScale);
+                ImGui.SliderFloat("Background padding", ref this.Settings.BackgroundPadding, 0f, 24f, "%.0f px");
 
-            ImGui.TextDisabled("XP percentages use the original XPBar threshold table. If a level's");
-            ImGui.TextDisabled("threshold segment is malformed or missing, the overlay shows XP only.");
+                ImGui.ColorEdit4("Text color", ref this.Settings.TextColor);
+                ImGui.ColorEdit4("Background color", ref this.Settings.BackgroundColor);
+            }
+
+            if (ImGui.CollapsingHeader("Debug / Advanced"))
+            {
+                ImGui.Checkbox("Show raw XP", ref this.Settings.ShowRawDebug);
+                ImGui.TextDisabled("XP percentages use the original XPBar threshold table. If a level's");
+                ImGui.TextDisabled("threshold segment is malformed or missing, the overlay shows XP only.");
+            }
         }
 
         public override void DrawUI()
@@ -180,6 +199,13 @@ namespace XPBar
                 return;
             }
 
+            if (this.Settings.HideWhenGameNotForeground &&
+                !Core.Process.Foreground &&
+                (!this.Settings.ShowWhenGameHelperForeground || !IsGameHelperForeground()))
+            {
+                return;
+            }
+
             var playerEntity = Core.States.InGameStateObject.CurrentAreaInstance.Player;
             if (!playerEntity.TryGetComponent<GameHelper.RemoteObjects.Components.Player>(out var player))
             {
@@ -188,9 +214,15 @@ namespace XPBar
 
             var level = player.Level;
             var rawXp = unchecked((uint)player.Xp);
+            this.Settings.DecimalPlaces = Math.Clamp(this.Settings.DecimalPlaces, 0, 4);
             var text = TryGetLevelPercent(level, rawXp, out var percent)
-                ? $"Level {level}: {percent:0.000}%"
-                : $"Level {level}: XP table unavailable";
+                ? $"{level}: {percent.ToString($"F{this.Settings.DecimalPlaces}", CultureInfo.InvariantCulture)}%"
+                : $"{level}: XP table unavailable";
+
+            if (!string.IsNullOrWhiteSpace(this.Settings.CustomLabel))
+            {
+                text = $"{this.Settings.CustomLabel} {text}";
+            }
 
             if (this.Settings.ShowRawDebug)
             {
@@ -224,13 +256,23 @@ namespace XPBar
         private void DrawOverlayText(string text)
         {
             var windowArea = Core.Process.WindowArea;
-            var textSize = ImGui.CalcTextSize(text);
-            var center = new Vector2(
+            var scale = this.Settings.TextScale;
+            if (this.Settings.AutoScale)
+            {
+                scale *= Math.Clamp(windowArea.Height / 1080f, 0.5f, 3f);
+            }
+
+            scale = Math.Clamp(scale, 0.5f, 3f);
+            var textSize = ImGui.CalcTextSize(text) * scale;
+            var anchor = new Vector2(
                 (windowArea.Width * 0.5f) + this.Settings.PositionX,
                 windowArea.Height + this.Settings.PositionY);
 
-            var pos = new Vector2(center.X - (textSize.X * 0.5f), center.Y - textSize.Y);
-            var padding = new Vector2(6f, 3f);
+            var pos = new Vector2(
+                this.Settings.CenterByWidth ? anchor.X - (textSize.X * 0.5f) : anchor.X,
+                anchor.Y - textSize.Y);
+            var paddingAmount = Math.Clamp(this.Settings.BackgroundPadding, 0f, 24f) * scale;
+            var padding = new Vector2(paddingAmount, paddingAmount * 0.5f);
             var drawList = ImGui.GetForegroundDrawList();
 
             if (this.Settings.ShowBackground)
@@ -239,10 +281,19 @@ namespace XPBar
                     pos - padding,
                     pos + textSize + padding,
                     ImGuiHelper.Color(this.Settings.BackgroundColor),
-                    3f);
+                    3f * scale);
             }
 
-            drawList.AddText(pos, ImGuiHelper.Color(this.Settings.TextColor), text);
+            drawList.AddText(ImGui.GetFont(), ImGui.GetFontSize() * scale, pos,
+                ImGuiHelper.Color(this.Settings.TextColor), text);
         }
+
+        private static bool IsGameHelperForeground()
+        {
+            return Process.GetCurrentProcess().MainWindowHandle == GetForegroundWindow();
+        }
+
+        [DllImport("user32.dll")]
+        private static extern nint GetForegroundWindow();
     }
 }
