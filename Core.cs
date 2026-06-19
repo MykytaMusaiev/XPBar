@@ -1,20 +1,24 @@
-﻿using System;
-using Color = System.Drawing.Color;
-using Vector2 = System.Numerics.Vector2;
-using ExileCore2;
-using ExileCore2.PoEMemory.Components;
-using ExileCore2.Shared.Enums;
-using Graphics = ExileCore2.Graphics;
-using RectangleF = ExileCore2.Shared.RectangleF;
-
 namespace XPBar
 {
-    public class Core : BaseSettingsPlugin<Settings>
-    {
-        #region ExpTable
+    using System;
+    using System.IO;
+    using System.Numerics;
+    using GameHelper;
+    using GameHelper.Plugin;
+    using GameHelper.RemoteEnums;
+    using GameHelper.Utils;
+    using ImGuiNET;
+    using Newtonsoft.Json;
 
-        private readonly uint[] ExpTable =
+    public sealed class XPBarCore : PCore<XPBarSettings>
+    {
+        // Cumulative XP thresholds from the original XPBar fork. Two entries are known to be
+        // non-monotonic in that source (levels 3 and 11), so calculation validates the requested
+        // level segment before using it instead of scanning across malformed data.
+        private static readonly uint[] ExperienceThresholdByLevel =
         {
+            0,
+            0,
             525,
             176,
             3781,
@@ -116,67 +120,129 @@ namespace XPBar
             4250334444,
         };
 
-        #endregion
+        private string SettingPathname => Path.Join(this.DllDirectory, "config", "settings.txt");
 
-        private uint CurDiff;
-        private int CurLvl = 0;
-        private uint CurMax;
-        private uint CurMin;
-        private void UpdateLevel()
+        public override void OnEnable(bool isGameOpened)
         {
-            var pExp = GameController.Player?.GetComponent<Player>()?.XP;
-            if (pExp == null) return;
-
-            for (var i = 0; i < ExpTable.Length - 1; i++)
+            if (!File.Exists(this.SettingPathname))
             {
-                var exp1 = ExpTable[i];
-                var exp2 = ExpTable[i + 1];
-
-                if (pExp > exp1 && pExp < exp2)
-                {
-                    CurMin = exp1;
-                    CurMax = exp2;
-                    CurLvl = i + 2;
-                    break;
-                }
-            }
-            CurDiff = CurMax - CurMin;
-        }
-
-        public override void AreaChange(AreaInstance area)
-        {
-            CurLvl = 0;
-            base.AreaChange(area);
-        }
-
-        public override void Render()
-        {
-            if (CurLvl == 0) {
-                UpdateLevel();
                 return;
             }
 
-            var pExp = GameController.Player.GetComponent<Player>().XP;
+            try
+            {
+                var content = File.ReadAllText(this.SettingPathname);
+                this.Settings = JsonConvert.DeserializeObject<XPBarSettings>(content) ?? new XPBarSettings();
+            }
+            catch (Exception ex) when (ex is IOException ||
+                                       ex is UnauthorizedAccessException ||
+                                       ex is System.Text.Json.JsonException ||
+                                       ex is JsonException)
+            {
+                Console.WriteLine($"[XPBar] Failed to load settings; using defaults. {ex.GetType().Name}: {ex.Message}");
+                this.Settings = new XPBarSettings();
+            }
+        }
 
-            pExp -= CurMin;
-            var proc = (float) pExp / CurDiff;
-            if ((proc *= 100) > 100) {
-                UpdateLevel();
+        public override void OnDisable()
+        {
+        }
+
+        public override void SaveSettings()
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(this.SettingPathname)!);
+            File.WriteAllText(this.SettingPathname, JsonConvert.SerializeObject(this.Settings, Formatting.Indented));
+        }
+
+        public override void DrawSettings()
+        {
+            ImGui.Checkbox("Enable XP overlay", ref this.Settings.Enable);
+            ImGui.Checkbox("Show background", ref this.Settings.ShowBackground);
+            ImGui.Checkbox("Show raw XP", ref this.Settings.ShowRawDebug);
+
+            ImGui.SliderFloat("Position X", ref this.Settings.PositionX, -800f, 800f, "%.0f px");
+            ImGui.SliderFloat("Position Y", ref this.Settings.PositionY, -400f, 200f, "%.0f px");
+
+            ImGui.ColorEdit4("Text color", ref this.Settings.TextColor);
+            ImGui.ColorEdit4("Background color", ref this.Settings.BackgroundColor);
+
+            ImGui.TextDisabled("XP percentages use the original XPBar threshold table. If a level's");
+            ImGui.TextDisabled("threshold segment is malformed or missing, the overlay shows XP only.");
+        }
+
+        public override void DrawUI()
+        {
+            if (!this.Settings.Enable ||
+                Core.States.GameCurrentState != GameStateTypes.InGameState ||
+                Core.Process.WindowArea.Width <= 0 ||
+                Core.Process.WindowArea.Height <= 0)
+            {
                 return;
             }
-            var procStr = CurLvl + ": " + Math.Round(proc, 3) + "%";
-            var size = Graphics.MeasureText(procStr, 20);
 
-            var scrRect = GameController.Window.GetWindowRectangle();
+            var playerEntity = Core.States.InGameStateObject.CurrentAreaInstance.Player;
+            if (!playerEntity.TryGetComponent<GameHelper.RemoteObjects.Components.Player>(out var player))
+            {
+                return;
+            }
 
-            var center = new Vector2(scrRect.X + scrRect.Width / 2, scrRect.Height - 10);
-            var textRect = center;
-            textRect.Y -= 10;
+            var level = player.Level;
+            var rawXp = unchecked((uint)player.Xp);
+            var text = TryGetLevelPercent(level, rawXp, out var percent)
+                ? $"Level {level}: {percent:0.000}%"
+                : $"Level {level}: XP table unavailable";
 
-            var drawRect = new RectangleF(center.X - 5 - size.X / 2, center.Y - size.Y / 2, size.X + 10, size.Y);
+            if (this.Settings.ShowRawDebug)
+            {
+                text += $"{Environment.NewLine}Raw XP: {rawXp}";
+            }
 
-            Graphics.DrawText(procStr, textRect, Color.White, FontAlign.Center);
-            Graphics.DrawBox(drawRect, Color.Black);
+            this.DrawOverlayText(text);
+        }
+
+        private static bool TryGetLevelPercent(int level, uint rawXp, out double percent)
+        {
+            percent = 0;
+            if (level < 0 || level + 1 >= ExperienceThresholdByLevel.Length)
+            {
+                return false;
+            }
+
+            var previous = level > 0 ? ExperienceThresholdByLevel[level - 1] : 0;
+            var current = ExperienceThresholdByLevel[level];
+            var next = ExperienceThresholdByLevel[level + 1];
+            if (current < previous || next <= current || rawXp < current)
+            {
+                return false;
+            }
+
+            var levelSpan = next - current;
+            percent = Math.Clamp(((double)(rawXp - current) / levelSpan) * 100.0, 0.0, 100.0);
+            return true;
+        }
+
+        private void DrawOverlayText(string text)
+        {
+            var windowArea = Core.Process.WindowArea;
+            var textSize = ImGui.CalcTextSize(text);
+            var center = new Vector2(
+                (windowArea.Width * 0.5f) + this.Settings.PositionX,
+                windowArea.Height + this.Settings.PositionY);
+
+            var pos = new Vector2(center.X - (textSize.X * 0.5f), center.Y - textSize.Y);
+            var padding = new Vector2(6f, 3f);
+            var drawList = ImGui.GetForegroundDrawList();
+
+            if (this.Settings.ShowBackground)
+            {
+                drawList.AddRectFilled(
+                    pos - padding,
+                    pos + textSize + padding,
+                    ImGuiHelper.Color(this.Settings.BackgroundColor),
+                    3f);
+            }
+
+            drawList.AddText(pos, ImGuiHelper.Color(this.Settings.TextColor), text);
         }
     }
 }
