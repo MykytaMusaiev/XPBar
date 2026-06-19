@@ -1,6 +1,7 @@
 namespace XPBar
 {
     using System;
+    using System.Collections.Generic;
     using System.Diagnostics;
     using System.Globalization;
     using System.IO;
@@ -128,8 +129,45 @@ namespace XPBar
         private int? sessionCurrentLevel;
         private uint? sessionCurrentXp;
         private bool resetSessionRequested;
+        private readonly Dictionary<string, AreaTrackingEntry> areaEntriesByIdentity = new(StringComparer.Ordinal);
+        private readonly List<string> areaHistoryOrder = new();
+        private string? currentAreaIdentity;
+        private bool resetCurrentAreaRequested;
 
         private string SettingPathname => Path.Join(this.DllDirectory, "config", "settings.txt");
+
+        private readonly record struct OverlayTextSegment(string Text, Vector4 Color);
+
+        private sealed class AreaTrackingEntry
+        {
+            public AreaTrackingEntry(string identity, string label, int level, uint xp)
+            {
+                this.Identity = identity;
+                this.Label = label;
+                this.StartLevel = level;
+                this.StartXp = xp;
+                this.CurrentLevel = level;
+                this.CurrentXp = xp;
+            }
+
+            public string Identity { get; }
+
+            public string Label { get; set; }
+
+            public int StartLevel { get; set; }
+
+            public uint StartXp { get; set; }
+
+            public int CurrentLevel { get; set; }
+
+            public uint CurrentXp { get; set; }
+
+            public void ResetBaseline()
+            {
+                this.StartLevel = this.CurrentLevel;
+                this.StartXp = this.CurrentXp;
+            }
+        }
 
         public override void OnEnable(bool isGameOpened)
         {
@@ -157,6 +195,7 @@ namespace XPBar
         public override void OnDisable()
         {
             this.ClearSessionTracking();
+            this.ClearAreaTracking();
         }
 
         public override void SaveSettings()
@@ -211,11 +250,32 @@ namespace XPBar
 
                 this.DrawSessionTrackingInfo();
             }
+
+            if (ImGui.CollapsingHeader("Area / Map XP Tracking"))
+            {
+                if (ImGui.Checkbox("Enable area/map XP tracking", ref this.Settings.EnableAreaMapXpTracking) &&
+                    !this.Settings.EnableAreaMapXpTracking)
+                {
+                    this.ClearAreaTracking();
+                }
+
+                ImGui.Checkbox("Show area gain in overlay", ref this.Settings.ShowAreaGainInOverlay);
+                ImGui.Checkbox("Show area history", ref this.Settings.ShowAreaHistory);
+                ImGui.SliderInt("Area history limit", ref this.Settings.AreaHistoryLimit, 1, 20);
+                ImGui.ColorEdit4("Positive area gain color", ref this.Settings.PositiveAreaGainColor);
+                ImGui.ColorEdit4("Negative area loss color", ref this.Settings.NegativeAreaLossColor);
+                if (ImGui.Button("Reset current area"))
+                {
+                    this.ResetCurrentAreaTracking();
+                }
+
+                this.DrawAreaTrackingInfo();
+            }
         }
 
         public override void DrawUI()
         {
-            if ((!this.Settings.Enable && !this.Settings.EnableXpTracking) ||
+            if ((!this.Settings.Enable && !this.Settings.EnableXpTracking && !this.Settings.EnableAreaMapXpTracking) ||
                 Core.States.GameCurrentState != GameStateTypes.InGameState)
             {
                 return;
@@ -230,6 +290,7 @@ namespace XPBar
             var level = player.Level;
             var rawXp = unchecked((uint)player.Xp);
             this.UpdateSessionTracking(level, rawXp);
+            this.UpdateAreaTracking(level, rawXp);
 
             if (!this.Settings.Enable ||
                 Core.Process.WindowArea.Width <= 0 ||
@@ -242,29 +303,53 @@ namespace XPBar
             }
 
             this.Settings.DecimalPlaces = Math.Clamp(this.Settings.DecimalPlaces, 0, 4);
-            var text = TryGetLevelPercent(level, rawXp, out var percent)
+            var mainText = TryGetLevelPercent(level, rawXp, out var percent)
                 ? $"{level}: {percent.ToString($"F{this.Settings.DecimalPlaces}", CultureInfo.InvariantCulture)}%"
                 : $"{level}: XP table unavailable";
 
             if (!string.IsNullOrWhiteSpace(this.Settings.CustomLabel))
             {
-                text = $"{this.Settings.CustomLabel} {text}";
+                mainText = $"{this.Settings.CustomLabel} {mainText}";
             }
 
-            if (this.Settings.EnableXpTracking && this.Settings.ShowSessionGainInOverlay &&
+            var segments = new List<OverlayTextSegment>
+            {
+                new(mainText, this.Settings.TextColor)
+            };
+            var areaDeltaVisible = false;
+            if (this.Settings.EnableAreaMapXpTracking && this.Settings.ShowAreaGainInOverlay &&
+                this.TryGetCurrentAreaDelta(out var areaRawDelta, out var areaPercent))
+            {
+                areaDeltaVisible = HasMeaningfulAreaDelta(areaRawDelta, areaPercent, this.Settings.DecimalPlaces);
+                if (areaDeltaVisible)
+                {
+                    var areaText = FormatAreaDelta(areaRawDelta, areaPercent, this.Settings.DecimalPlaces);
+                    var areaColor = areaRawDelta < 0
+                        ? this.Settings.NegativeAreaLossColor
+                        : this.Settings.PositiveAreaGainColor;
+                    var areaSegment = new OverlayTextSegment(areaText, areaColor);
+                    if (areaRawDelta < 0)
+                    {
+                        segments.Insert(0, new OverlayTextSegment("   ", this.Settings.TextColor));
+                        segments.Insert(0, areaSegment);
+                    }
+                    else
+                    {
+                        segments.Add(new OverlayTextSegment("   ", this.Settings.TextColor));
+                        segments.Add(areaSegment);
+                    }
+                }
+            }
+            if (!areaDeltaVisible && this.Settings.EnableXpTracking && this.Settings.ShowSessionGainInOverlay &&
                 this.TryGetSessionGain(out var sessionRawGain, out var sessionPercent))
             {
-                text += sessionPercent.HasValue
+                var sessionText = sessionPercent.HasValue
                     ? $"  +{sessionPercent.Value.ToString($"F{this.Settings.DecimalPlaces}", CultureInfo.InvariantCulture)}%"
                     : $"  +{sessionRawGain} XP";
+                segments.Add(new OverlayTextSegment(sessionText, this.Settings.TextColor));
             }
 
-            if (this.Settings.ShowRawDebug)
-            {
-                text += $"{Environment.NewLine}Raw XP: {rawXp}";
-            }
-
-            this.DrawOverlayText(text);
+            this.DrawOverlayText(segments, this.Settings.ShowRawDebug ? $"Raw XP: {rawXp}" : null);
         }
 
         private static bool TryGetLevelPercent(int level, uint rawXp, out double percent)
@@ -440,7 +525,225 @@ namespace XPBar
             }
         }
 
-        private void DrawOverlayText(string text)
+        private void UpdateAreaTracking(int level, uint rawXp)
+        {
+            if (!this.Settings.EnableAreaMapXpTracking)
+            {
+                return;
+            }
+
+            this.Settings.AreaHistoryLimit = Math.Clamp(this.Settings.AreaHistoryLimit, 1, 20);
+            var areaInstance = Core.States.InGameStateObject.CurrentAreaInstance;
+            var areaDetails = Core.States.InGameStateObject.CurrentWorldInstance.AreaDetails;
+            var areaIdentity = areaInstance.AreaHash;
+            if (string.IsNullOrEmpty(areaIdentity) || areaDetails.IsTown || areaDetails.IsHideout)
+            {
+                this.currentAreaIdentity = null;
+                return;
+            }
+
+            var areaLabel = !string.IsNullOrWhiteSpace(areaDetails.Name) ? areaDetails.Name : areaDetails.Id;
+            if (string.IsNullOrWhiteSpace(areaLabel))
+            {
+                areaLabel = areaIdentity;
+            }
+
+            if (!this.areaEntriesByIdentity.TryGetValue(areaIdentity, out var areaEntry))
+            {
+                areaEntry = new AreaTrackingEntry(areaIdentity, areaLabel, level, rawXp);
+                this.areaEntriesByIdentity[areaIdentity] = areaEntry;
+            }
+            else
+            {
+                areaEntry.Label = areaLabel;
+                areaEntry.CurrentLevel = level;
+                areaEntry.CurrentXp = rawXp;
+            }
+
+            if (this.resetCurrentAreaRequested)
+            {
+                areaEntry.ResetBaseline();
+                this.resetCurrentAreaRequested = false;
+            }
+
+            this.currentAreaIdentity = areaIdentity;
+            this.TouchAreaHistory(areaIdentity);
+            this.PruneAreaHistory();
+        }
+
+        private void ClearAreaTracking()
+        {
+            this.areaEntriesByIdentity.Clear();
+            this.areaHistoryOrder.Clear();
+            this.currentAreaIdentity = null;
+            this.resetCurrentAreaRequested = false;
+        }
+
+        private void ResetCurrentAreaTracking()
+        {
+            if (this.currentAreaIdentity != null &&
+                this.areaEntriesByIdentity.TryGetValue(this.currentAreaIdentity, out var areaEntry))
+            {
+                areaEntry.ResetBaseline();
+                return;
+            }
+
+            this.resetCurrentAreaRequested = true;
+        }
+
+        private void TouchAreaHistory(string areaIdentity)
+        {
+            this.areaHistoryOrder.Remove(areaIdentity);
+            this.areaHistoryOrder.Insert(0, areaIdentity);
+        }
+
+        private void PruneAreaHistory()
+        {
+            while (this.areaHistoryOrder.Count > this.Settings.AreaHistoryLimit)
+            {
+                var oldestAreaIdentity = this.areaHistoryOrder[^1];
+                this.areaHistoryOrder.RemoveAt(this.areaHistoryOrder.Count - 1);
+                this.areaEntriesByIdentity.Remove(oldestAreaIdentity);
+            }
+        }
+
+        private bool TryGetCurrentAreaDelta(out long rawDelta, out double? percent)
+        {
+            rawDelta = 0;
+            percent = null;
+            if (this.currentAreaIdentity == null ||
+                !this.areaEntriesByIdentity.TryGetValue(this.currentAreaIdentity, out var areaEntry))
+            {
+                return false;
+            }
+
+            rawDelta = (long)areaEntry.CurrentXp - areaEntry.StartXp;
+            if (TryGetXpDeltaPercent(
+                    areaEntry.StartLevel,
+                    areaEntry.StartXp,
+                    areaEntry.CurrentLevel,
+                    areaEntry.CurrentXp,
+                    out var areaPercent))
+            {
+                percent = areaPercent;
+            }
+
+            return true;
+        }
+
+        private static bool TryGetXpDeltaPercent(
+            int startLevel,
+            uint startXp,
+            int currentLevel,
+            uint currentXp,
+            out double percent)
+        {
+            percent = 0;
+            if (!TryGetLevelProgressPercent(startLevel, startXp, out var startProgress) ||
+                !TryGetLevelProgressPercent(currentLevel, currentXp, out var currentProgress))
+            {
+                return false;
+            }
+
+            var firstLevel = Math.Min(startLevel, currentLevel);
+            var lastLevel = Math.Max(startLevel, currentLevel);
+            for (var level = firstLevel; level <= lastLevel; level++)
+            {
+                if (!TryGetLevelThresholds(level, out _, out _))
+                {
+                    return false;
+                }
+            }
+
+            percent = currentProgress - startProgress;
+            return true;
+        }
+
+        private static bool TryGetLevelProgressPercent(int level, uint rawXp, out double progress)
+        {
+            progress = 0;
+            if (!TryGetLevelThresholds(level, out var current, out var next) || rawXp < current || rawXp > next)
+            {
+                return false;
+            }
+
+            progress = (level * 100.0) + (((double)(rawXp - current) / (next - current)) * 100.0);
+            return true;
+        }
+
+        private static string FormatAreaDelta(long rawDelta, double? percent, int decimalPlaces)
+        {
+            var sign = rawDelta < 0 ? "-" : "+";
+            if (percent.HasValue)
+            {
+                return $"{sign}{Math.Abs(percent.Value).ToString($"F{Math.Clamp(decimalPlaces, 0, 4)}", CultureInfo.InvariantCulture)}%";
+            }
+
+            return $"{sign}{Math.Abs(rawDelta)} XP";
+        }
+
+        private static bool HasMeaningfulAreaDelta(long rawDelta, double? percent, int decimalPlaces)
+        {
+            if (!percent.HasValue)
+            {
+                return rawDelta != 0;
+            }
+
+            var formattedMagnitude = Math.Abs(percent.Value)
+                .ToString($"F{Math.Clamp(decimalPlaces, 0, 4)}", CultureInfo.InvariantCulture);
+            return formattedMagnitude.Trim('0', '.').Length > 0;
+        }
+
+        private void DrawAreaTrackingInfo()
+        {
+            if (!this.Settings.EnableAreaMapXpTracking)
+            {
+                return;
+            }
+
+            this.Settings.AreaHistoryLimit = Math.Clamp(this.Settings.AreaHistoryLimit, 1, 20);
+            if (this.currentAreaIdentity == null ||
+                !this.areaEntriesByIdentity.TryGetValue(this.currentAreaIdentity, out var currentAreaEntry))
+            {
+                ImGui.TextDisabled("Waiting for a non-town/non-hideout area and player XP.");
+            }
+            else
+            {
+                ImGui.TextDisabled($"Current area: {currentAreaEntry.Label} ({currentAreaEntry.Identity})");
+                if (this.TryGetCurrentAreaDelta(out var currentRawDelta, out var currentPercent))
+                {
+                    ImGui.TextDisabled($"Current area delta: {FormatAreaDelta(currentRawDelta, currentPercent, this.Settings.DecimalPlaces)}");
+                }
+            }
+
+            if (!this.Settings.ShowAreaHistory)
+            {
+                return;
+            }
+
+            ImGui.TextDisabled("Area history");
+            var entriesToShow = Math.Min(this.areaHistoryOrder.Count, this.Settings.AreaHistoryLimit);
+            for (var i = 0; i < entriesToShow; i++)
+            {
+                var areaIdentity = this.areaHistoryOrder[i];
+                if (!this.areaEntriesByIdentity.TryGetValue(areaIdentity, out var areaEntry))
+                {
+                    continue;
+                }
+
+                var rawDelta = (long)areaEntry.CurrentXp - areaEntry.StartXp;
+                var hasPercent = TryGetXpDeltaPercent(
+                    areaEntry.StartLevel,
+                    areaEntry.StartXp,
+                    areaEntry.CurrentLevel,
+                    areaEntry.CurrentXp,
+                    out var percent);
+                ImGui.TextDisabled(
+                    $"{areaEntry.Label} ({areaEntry.Identity}): {FormatAreaDelta(rawDelta, hasPercent ? percent : null, this.Settings.DecimalPlaces)}");
+            }
+        }
+
+        private void DrawOverlayText(IReadOnlyList<OverlayTextSegment> segments, string? debugText)
         {
             var windowArea = Core.Process.WindowArea;
             var scale = this.Settings.TextScale;
@@ -450,7 +753,17 @@ namespace XPBar
             }
 
             scale = Math.Clamp(scale, 0.5f, 3f);
-            var textSize = ImGui.CalcTextSize(text) * scale;
+            var firstLineWidth = 0f;
+            foreach (var segment in segments)
+            {
+                firstLineWidth += ImGui.CalcTextSize(segment.Text).X;
+            }
+
+            var lineHeight = ImGui.GetFontSize();
+            var debugTextSize = string.IsNullOrEmpty(debugText) ? Vector2.Zero : ImGui.CalcTextSize(debugText);
+            var textSize = new Vector2(
+                Math.Max(firstLineWidth, debugTextSize.X),
+                lineHeight + (string.IsNullOrEmpty(debugText) ? 0f : debugTextSize.Y)) * scale;
             var anchor = new Vector2(
                 (windowArea.Width * 0.5f) + this.Settings.PositionX,
                 windowArea.Height + this.Settings.PositionY);
@@ -471,8 +784,20 @@ namespace XPBar
                     3f * scale);
             }
 
-            drawList.AddText(ImGui.GetFont(), ImGui.GetFontSize() * scale, pos,
-                ImGuiHelper.Color(this.Settings.TextColor), text);
+            var textPos = pos;
+            foreach (var segment in segments)
+            {
+                drawList.AddText(ImGui.GetFont(), ImGui.GetFontSize() * scale, textPos,
+                    ImGuiHelper.Color(segment.Color), segment.Text);
+                textPos.X += ImGui.CalcTextSize(segment.Text).X * scale;
+            }
+
+            if (!string.IsNullOrEmpty(debugText))
+            {
+                drawList.AddText(ImGui.GetFont(), ImGui.GetFontSize() * scale,
+                    new Vector2(pos.X, pos.Y + (lineHeight * scale)),
+                    ImGuiHelper.Color(this.Settings.TextColor), debugText);
+            }
         }
 
         private static bool IsGameHelperForeground()
