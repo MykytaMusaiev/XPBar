@@ -6,6 +6,8 @@ namespace XPBar
     public sealed class XPBarSettings : IPSettings
     {
         public bool Enable = true;
+        public bool EnableXpTracking = false;
+        public bool ShowSessionGainInOverlay = false;
         public bool ShowBackground = true;
         public bool ShowRawDebug = false;
         public bool HideWhenGameNotForeground = true;

@@ -123,6 +123,12 @@ namespace XPBar
             4250334444,
         };
 
+        private int? sessionStartLevel;
+        private uint? sessionStartXp;
+        private int? sessionCurrentLevel;
+        private uint? sessionCurrentXp;
+        private bool resetSessionRequested;
+
         private string SettingPathname => Path.Join(this.DllDirectory, "config", "settings.txt");
 
         public override void OnEnable(bool isGameOpened)
@@ -150,6 +156,7 @@ namespace XPBar
 
         public override void OnDisable()
         {
+            this.ClearSessionTracking();
         }
 
         public override void SaveSettings()
@@ -160,7 +167,7 @@ namespace XPBar
 
         public override void DrawSettings()
         {
-            ImGui.Checkbox("Enable XP overlay", ref this.Settings.Enable);
+            ImGui.Checkbox("Show XP overlay", ref this.Settings.Enable);
 
             if (ImGui.CollapsingHeader("Basic Settings"))
             {
@@ -187,21 +194,29 @@ namespace XPBar
                 ImGui.TextDisabled("XP percentages use the original XPBar threshold table. If a level's");
                 ImGui.TextDisabled("threshold segment is malformed or missing, the overlay shows XP only.");
             }
+
+            if (ImGui.CollapsingHeader("XP Tracking"))
+            {
+                if (ImGui.Checkbox("Enable XP tracking", ref this.Settings.EnableXpTracking) &&
+                    !this.Settings.EnableXpTracking)
+                {
+                    this.ClearSessionTracking();
+                }
+
+                ImGui.Checkbox("Show session gain in overlay", ref this.Settings.ShowSessionGainInOverlay);
+                if (ImGui.Button("Reset session"))
+                {
+                    this.ResetSessionTracking();
+                }
+
+                this.DrawSessionTrackingInfo();
+            }
         }
 
         public override void DrawUI()
         {
-            if (!this.Settings.Enable ||
-                Core.States.GameCurrentState != GameStateTypes.InGameState ||
-                Core.Process.WindowArea.Width <= 0 ||
-                Core.Process.WindowArea.Height <= 0)
-            {
-                return;
-            }
-
-            if (this.Settings.HideWhenGameNotForeground &&
-                !Core.Process.Foreground &&
-                (!this.Settings.ShowWhenGameHelperForeground || !IsGameHelperForeground()))
+            if ((!this.Settings.Enable && !this.Settings.EnableXpTracking) ||
+                Core.States.GameCurrentState != GameStateTypes.InGameState)
             {
                 return;
             }
@@ -214,6 +229,18 @@ namespace XPBar
 
             var level = player.Level;
             var rawXp = unchecked((uint)player.Xp);
+            this.UpdateSessionTracking(level, rawXp);
+
+            if (!this.Settings.Enable ||
+                Core.Process.WindowArea.Width <= 0 ||
+                Core.Process.WindowArea.Height <= 0 ||
+                (this.Settings.HideWhenGameNotForeground &&
+                 !Core.Process.Foreground &&
+                 (!this.Settings.ShowWhenGameHelperForeground || !IsGameHelperForeground())))
+            {
+                return;
+            }
+
             this.Settings.DecimalPlaces = Math.Clamp(this.Settings.DecimalPlaces, 0, 4);
             var text = TryGetLevelPercent(level, rawXp, out var percent)
                 ? $"{level}: {percent.ToString($"F{this.Settings.DecimalPlaces}", CultureInfo.InvariantCulture)}%"
@@ -222,6 +249,14 @@ namespace XPBar
             if (!string.IsNullOrWhiteSpace(this.Settings.CustomLabel))
             {
                 text = $"{this.Settings.CustomLabel} {text}";
+            }
+
+            if (this.Settings.EnableXpTracking && this.Settings.ShowSessionGainInOverlay &&
+                this.TryGetSessionGain(out var sessionRawGain, out var sessionPercent))
+            {
+                text += sessionPercent.HasValue
+                    ? $"  +{sessionPercent.Value.ToString($"F{this.Settings.DecimalPlaces}", CultureInfo.InvariantCulture)}%"
+                    : $"  +{sessionRawGain} XP";
             }
 
             if (this.Settings.ShowRawDebug)
@@ -235,15 +270,7 @@ namespace XPBar
         private static bool TryGetLevelPercent(int level, uint rawXp, out double percent)
         {
             percent = 0;
-            if (level < 0 || level + 1 >= ExperienceThresholdByLevel.Length)
-            {
-                return false;
-            }
-
-            var previous = level > 0 ? ExperienceThresholdByLevel[level - 1] : 0;
-            var current = ExperienceThresholdByLevel[level];
-            var next = ExperienceThresholdByLevel[level + 1];
-            if (current < previous || next <= current || rawXp < current)
+            if (!TryGetLevelThresholds(level, out var current, out var next) || rawXp < current)
             {
                 return false;
             }
@@ -251,6 +278,166 @@ namespace XPBar
             var levelSpan = next - current;
             percent = Math.Clamp(((double)(rawXp - current) / levelSpan) * 100.0, 0.0, 100.0);
             return true;
+        }
+
+        private static bool TryGetLevelThresholds(int level, out uint current, out uint next)
+        {
+            current = 0;
+            next = 0;
+            if (level < 0 || level + 1 >= ExperienceThresholdByLevel.Length)
+            {
+                return false;
+            }
+
+            var previous = level > 0 ? ExperienceThresholdByLevel[level - 1] : 0;
+            current = ExperienceThresholdByLevel[level];
+            next = ExperienceThresholdByLevel[level + 1];
+            if (current < previous || next <= current)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private void UpdateSessionTracking(int level, uint rawXp)
+        {
+            if (!this.Settings.EnableXpTracking)
+            {
+                return;
+            }
+
+            if (this.resetSessionRequested || !this.sessionStartLevel.HasValue || !this.sessionStartXp.HasValue ||
+                level < this.sessionStartLevel.Value || rawXp < this.sessionStartXp.Value)
+            {
+                this.sessionStartLevel = level;
+                this.sessionStartXp = rawXp;
+                this.resetSessionRequested = false;
+            }
+
+            this.sessionCurrentLevel = level;
+            this.sessionCurrentXp = rawXp;
+        }
+
+        private void ClearSessionTracking()
+        {
+            this.sessionStartLevel = null;
+            this.sessionStartXp = null;
+            this.sessionCurrentLevel = null;
+            this.sessionCurrentXp = null;
+            this.resetSessionRequested = false;
+        }
+
+        private void ResetSessionTracking()
+        {
+            this.sessionStartLevel = this.sessionCurrentLevel;
+            this.sessionStartXp = this.sessionCurrentXp;
+            this.resetSessionRequested = !this.sessionStartLevel.HasValue || !this.sessionStartXp.HasValue;
+        }
+
+        private bool TryGetSessionGain(out uint rawGain, out double? percent)
+        {
+            rawGain = 0;
+            percent = null;
+            if (!this.sessionStartLevel.HasValue || !this.sessionStartXp.HasValue ||
+                !this.sessionCurrentLevel.HasValue || !this.sessionCurrentXp.HasValue ||
+                this.sessionCurrentLevel.Value < this.sessionStartLevel.Value ||
+                this.sessionCurrentXp.Value < this.sessionStartXp.Value)
+            {
+                return false;
+            }
+
+            rawGain = this.sessionCurrentXp.Value - this.sessionStartXp.Value;
+            if (TryGetSessionGainPercent(
+                    this.sessionStartLevel.Value,
+                    this.sessionStartXp.Value,
+                    this.sessionCurrentLevel.Value,
+                    this.sessionCurrentXp.Value,
+                    out var sessionPercent))
+            {
+                percent = sessionPercent;
+            }
+
+            return true;
+        }
+
+        private static bool TryGetSessionGainPercent(
+            int startLevel,
+            uint startXp,
+            int currentLevel,
+            uint currentXp,
+            out double percent)
+        {
+            percent = 0;
+            if (currentLevel < startLevel || currentXp < startXp ||
+                !TryGetLevelThresholds(startLevel, out var startThreshold, out var startNextThreshold) ||
+                startXp < startThreshold || startXp > startNextThreshold)
+            {
+                return false;
+            }
+
+            if (currentLevel == startLevel)
+            {
+                if (currentXp > startNextThreshold)
+                {
+                    return false;
+                }
+
+                percent = ((double)(currentXp - startXp) / (startNextThreshold - startThreshold)) * 100.0;
+                return true;
+            }
+
+            if (!TryGetLevelThresholds(currentLevel, out var currentThreshold, out var currentNextThreshold) ||
+                currentXp < currentThreshold || currentXp > currentNextThreshold)
+            {
+                return false;
+            }
+
+            percent = ((double)(startNextThreshold - startXp) / (startNextThreshold - startThreshold)) * 100.0;
+            for (var level = startLevel + 1; level < currentLevel; level++)
+            {
+                if (!TryGetLevelThresholds(level, out _, out _))
+                {
+                    return false;
+                }
+
+                percent += 100.0;
+            }
+
+            percent += ((double)(currentXp - currentThreshold) / (currentNextThreshold - currentThreshold)) * 100.0;
+            return true;
+        }
+
+        private void DrawSessionTrackingInfo()
+        {
+            if (!this.Settings.EnableXpTracking)
+            {
+                return;
+            }
+
+            if (!this.sessionStartLevel.HasValue || !this.sessionStartXp.HasValue)
+            {
+                ImGui.TextDisabled("Waiting for valid player XP.");
+                return;
+            }
+
+            ImGui.TextDisabled($"Session start: Level {this.sessionStartLevel.Value}, XP {this.sessionStartXp.Value}");
+            if (!this.TryGetSessionGain(out var rawGain, out var percent))
+            {
+                return;
+            }
+
+            ImGui.TextDisabled($"Session gained: +{rawGain} XP");
+            if (percent.HasValue)
+            {
+                var decimalPlaces = Math.Clamp(this.Settings.DecimalPlaces, 0, 4);
+                ImGui.TextDisabled(
+                    $"Session gained percent: +{percent.Value.ToString($"F{decimalPlaces}", CultureInfo.InvariantCulture)}%");
+            }
+            else
+            {
+                ImGui.TextDisabled("Session gained percent is unavailable for this XP table segment.");
+            }
         }
 
         private void DrawOverlayText(string text)
